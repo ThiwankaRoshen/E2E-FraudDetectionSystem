@@ -1,0 +1,327 @@
+import boto3
+import pandas as pd
+import pickle
+import io
+import logging
+from typing import Any, Optional, List
+from pathlib import Path
+
+import sys
+import os
+from config.setting import settings
+
+logger = logging.getLogger(__name__)
+
+
+def get_s3_client():
+    # Get credentials and region
+    aws_access_key_id = settings.aws_access_key_id
+    aws_secret_access_key = settings.aws_secret_access_key
+    region = settings.aws_s3_region
+    
+    if aws_access_key_id and aws_secret_access_key:        
+        logging.debug(f"Creating S3 client with access key: {aws_access_key_id[:4]}**** and region: {region}")
+        client = boto3.client(
+            's3',
+            region_name=region,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+        )
+        return client
+
+def put_bytes(data: bytes, key: str, content_type: Optional[str] = None) -> None:
+    """
+    Upload bytes data to S3
+    
+    Args:
+        data: Bytes data to upload
+        key: S3 key (path)
+        content_type: MIME content type
+    """
+    bucket = settings.aws_s3_bucket
+    s3_client = get_s3_client()
+    
+    put_kwargs = {
+        'Bucket': bucket,
+        'Key': key,
+        'Body': data,
+    }
+    
+    if content_type:
+        put_kwargs['ContentType'] = content_type
+     
+    try:
+        s3_client.put_object(**put_kwargs)
+        logger.info(f"✅ Uploaded {len(data)} bytes to s3://{bucket}/{key}")
+    except Exception as e:
+        logger.error(f"❌ Failed to upload to s3://{bucket}/{key}: {e}")
+        raise
+
+
+def get_bytes(key: str) -> bytes:
+    """
+    Download bytes data from S3
+    
+    Args:
+        key: S3 key (path)
+        
+    Returns:
+        Bytes data
+    """
+    bucket = settings.aws_s3_bucket
+    s3_client = get_s3_client()
+    
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        data = response['Body'].read()
+        logger.info(f"✅ Downloaded {len(data)} bytes from s3://{bucket}/{key}")
+        return data
+    except Exception as e:
+        logger.error(f"❌ Failed to download from s3://{bucket}/{key}: {e}")
+        raise
+
+
+def upload_file(local_path, *, key: str) -> None:
+    """
+    Upload file to S3 with multipart transfer
+    
+    Args:
+        local_path: Local file path
+        key: S3 key (path)
+    """
+    bucket = settings.aws_s3_bucket
+    s3_client = get_s3_client()
+    
+    local_path = Path(local_path)
+    if not local_path.exists():
+        raise FileNotFoundError(f"Local file not found: {local_path}")
+    
+
+    try:
+        s3_client.upload_file(
+            str(local_path), 
+            bucket, 
+            key,  
+        )
+        file_size = local_path.stat().st_size
+        logger.info(f"✅ Uploaded {file_size} bytes from {local_path} to s3://{bucket}/{key}")
+    except Exception as e:
+        logger.error(f"❌ Failed to upload {local_path} to s3://{bucket}/{key}: {e}")
+        raise
+
+
+def download_file(key: str, local_path) -> None:
+    """
+    Download file from S3 to local path (for debugging only)
+    
+    Args:
+        key: S3 key (path)
+        local_path: Local file path to save
+    """
+    bucket = settings.aws_s3_bucket
+    s3_client = get_s3_client()
+    
+    local_path = Path(local_path)
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        s3_client.download_file(bucket, key, str(local_path))
+        file_size = local_path.stat().st_size
+        logger.info(f"✅ Downloaded {file_size} bytes from s3://{bucket}/{key} to {local_path}")
+    except Exception as e:
+        logger.error(f"❌ Failed to download s3://{bucket}/{key} to {local_path}: {e}")
+        raise
+
+
+def write_df_csv(df: pd.DataFrame, key: str) -> None:
+    """
+    Write pandas DataFrame to S3 as CSV
+    
+    Args:
+        df: DataFrame to write
+        key: S3 key (path)
+    """
+    buffer = io.StringIO()
+    df.to_csv(buffer, index=False)
+    csv_data = buffer.getvalue().encode('utf-8')
+    
+    put_bytes(csv_data, key=key, content_type='text/csv')
+    logger.info(f"✅ Wrote DataFrame ({df.shape}) as CSV to s3://{settings.aws_s3_bucket}/{key}")
+
+
+def read_df_csv(key: str) -> pd.DataFrame:
+    """
+    Read pandas DataFrame from S3 CSV
+    
+    Args:
+        key: S3 key (path)
+        
+    Returns:
+        pandas DataFrame
+    """
+    csv_data = get_bytes(key)
+    buffer = io.StringIO(csv_data.decode('utf-8'))
+    df = pd.read_csv(buffer)
+    
+    logger.info(f"✅ Read DataFrame ({df.shape}) from CSV s3://{settings.aws_s3_bucket}/{key}")
+    return df
+
+
+def write_df_json(df: pd.DataFrame, key: str) -> None:
+    """
+    Write pandas DataFrame to S3 as JSON
+    
+    Args:
+        df: DataFrame to write
+        key: S3 key (path)
+    """
+    json_data = df.to_json(orient='records').encode('utf-8')
+    put_bytes(json_data, key=key, content_type='application/json')
+    logger.info(f"✅ Wrote DataFrame ({df.shape}) as JSON to s3://{settings.aws_s3_bucket}/{key}")
+
+
+def read_df_json(key: str) -> pd.DataFrame:
+    """
+    Read pandas DataFrame from S3 JSON
+    
+    Args:
+        key: S3 key (path)
+        
+    Returns:
+        pandas DataFrame
+    """
+    json_data = get_bytes(key)
+    df = pd.read_json(io.StringIO(json_data.decode('utf-8')), orient='records')
+    
+    logger.info(f"✅ Read DataFrame ({df.shape}) from JSON s3://{settings.aws_s3_bucket}/{key}")
+    return df
+
+
+def write_pickle(obj: Any, key: str, use_joblib: bool = True) -> None:
+    """
+    Write Python object to S3 using joblib (preferred for sklearn) or pickle
+    
+    Args:
+        obj: Object to serialize
+        key: S3 key (path)
+        use_joblib: Use joblib instead of pickle (recommended for sklearn models)
+    """
+    buffer = io.BytesIO()
+    
+    if use_joblib:
+        # Use joblib for sklearn models (more efficient, handles numpy arrays better)
+        import joblib
+        joblib.dump(obj, buffer, compress=3)  # compress=3 for good balance
+        serializer = "joblib"
+    else:
+        # Fallback to pickle for other objects
+        pickle.dump(obj, buffer)
+        serializer = "pickle"
+    
+    pickle_data = buffer.getvalue()
+    
+    put_bytes(pickle_data, key=key, content_type='application/octet-stream')
+    logger.info(f"✅ Wrote {serializer} object ({len(pickle_data)} bytes) to s3://{settings.aws_s3_bucket}/{key}")
+
+
+def read_pickle(key: str, use_joblib: bool = True) -> Any:
+    """
+    Read Python object from S3 using joblib (preferred) or pickle
+    
+    Args:
+        key: S3 key (path)
+        use_joblib: Try joblib first, fallback to pickle if it fails
+        
+    Returns:
+        Deserialized object
+    """
+    pickle_data = get_bytes(key)
+    buffer = io.BytesIO(pickle_data)
+    
+    if use_joblib:
+        try:
+            # Try joblib first (for sklearn models)
+            import joblib
+            obj = joblib.load(buffer)
+            logger.info(f"✅ Read joblib object ({len(pickle_data)} bytes) from s3://{settings.aws_s3_bucket}/{key}")
+            return obj
+        except Exception as e:
+            # Fallback to pickle if joblib fails
+            logger.debug(f"Joblib load failed, trying pickle: {e}")
+            buffer.seek(0)  # Reset buffer position
+            obj = pickle.load(buffer)
+            logger.info(f"✅ Read pickle object ({len(pickle_data)} bytes) from s3://{settings.aws_s3_bucket}/{key}")
+            return obj
+    else:
+        obj = pickle.load(buffer)
+        logger.info(f"✅ Read pickle object ({len(pickle_data)} bytes) from s3://{settings.aws_s3_bucket}/{key}")
+        return obj
+
+
+def list_keys(prefix: str = "") -> List[str]:
+    """
+    List S3 keys with given prefix using pagination
+    
+    Args:
+        prefix: Key prefix to filter
+        
+    Returns:
+        List of S3 keys
+    """
+    bucket = settings.aws_s3_bucket
+    s3_client = get_s3_client()
+    
+    keys = []
+    paginator = s3_client.get_paginator('list_objects_v2')
+    
+    try:
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            if 'Contents' in page:
+                keys.extend([obj['Key'] for obj in page['Contents']])
+        
+        logger.info(f"✅ Listed {len(keys)} keys with prefix '{prefix}' from s3://{bucket}")
+        return keys
+    except Exception as e:
+        logger.error(f"❌ Failed to list keys with prefix '{prefix}' from s3://{bucket}: {e}")
+        raise
+
+
+def delete_key(key: str) -> None:
+    """
+    Delete S3 key
+    
+    Args:
+        key: S3 key (path) to delete
+    """
+    bucket = settings.aws_s3_bucket
+    s3_client = get_s3_client()
+    
+    try:
+        s3_client.delete_object(Bucket=bucket, Key=key)
+        logger.info(f"✅ Deleted s3://{bucket}/{key}")
+    except Exception as e:
+        logger.error(f"❌ Failed to delete s3://{bucket}/{key}: {e}")
+        raise
+
+
+def key_exists(key: str) -> bool:
+    """
+    Check if S3 key exists
+    
+    Args:
+        key: S3 key (path) to check
+        
+    Returns:
+        True if key exists, False otherwise
+    """
+    bucket = settings.aws_s3_bucket
+    s3_client = get_s3_client()
+    
+    try:
+        s3_client.head_object(Bucket=bucket, Key=key)
+        return True
+    except s3_client.exceptions.NoSuchKey:
+        return False
+    except Exception as e:
+        logger.error(f"❌ Error checking existence of s3://{bucket}/{key}: {e}")
+        return False
